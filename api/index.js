@@ -1,0 +1,437 @@
+import express from 'express';
+import cors from 'cors';
+import path from 'path';
+import { fileURLToPath } from 'url';
+import fs from 'fs';
+import { createClient } from '@supabase/supabase-js';
+
+import { storeConfig } from '../store.config.js';
+import { getLatestRate, setRate } from './services/exchangeRateService.js';
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+const projectRoot = path.join(__dirname, '..');
+
+const app = express();
+app.set('trust proxy', true); // necesario en Vercel para que req.protocol detecte "https" bien
+
+app.use(cors());
+app.use(express.json({ limit: '10mb' }));
+app.use(express.urlencoded({ limit: '10mb', extended: true }));
+
+// ─── Cliente Supabase (público y de servicio) ─────────────────────────────
+const supabase = createClient(storeConfig.supabase.url, storeConfig.supabase.anonKey);
+
+// El cliente de servicio (acceso total) solo se crea si existe la clave,
+// y SOLO se usa en el backend. Nunca se envía al navegador.
+export const supabaseService = storeConfig.supabase.serviceRoleKey
+  ? createClient(storeConfig.supabase.url, storeConfig.supabase.serviceRoleKey)
+  : null;
+
+// ─── Catálogo en memoria (cache simple) ───────────────────────────────────
+let productos = [];
+
+async function cargarProductos() {
+  try {
+    const { data, error } = await supabase.from('productos').select('*');
+    if (error) throw error;
+
+    const rate = storeConfig.mostrarTasaCambio ? await getLatestRate() : 1;
+
+    productos = data.map((p) => ({
+      id: p.id,
+      nombre: p.nombre,
+      // Si la tienda opera SOLO en CUP, "precio" ya es el valor en CUP
+      // directo (no hay USD, no hay tasa que aplicar). Si maneja USD+CUP,
+      // "precio" es USD y se calcula el CUP con la tasa. Si es solo USD,
+      // precio_cup queda en null.
+      precio_usd: storeConfig.soloCup ? null : p.precio,
+      precio_cup: storeConfig.soloCup
+        ? p.precio
+        : (storeConfig.mostrarTasaCambio ? Math.round(p.precio * rate) : null),
+      categoria: p.categoria,
+      subcategoria: p.subcategoria || 'General',
+      disponible: p.disponible,
+      img: p.img || `https://via.placeholder.com/400x300?text=${encodeURIComponent(p.nombre)}`,
+      descripcion: p.descripcion || '',
+      // Costo/cantidad: solo para métricas del admin. NUNCA se envían al
+      // catálogo público (ver el "sanear" antes de responder /api/products).
+      costo: p.costo === null || p.costo === undefined ? null : Number(p.costo),
+      cantidad: p.cantidad === null || p.cantidad === undefined ? null : Number(p.cantidad),
+    }));
+    console.log(`[${storeConfig.nombre}] Cargados ${productos.length} productos desde Supabase`);
+  } catch (e) {
+    console.error(`[${storeConfig.nombre}] Error al cargar productos desde Supabase:`, e.message);
+    // Fallback opcional a un JSON local llamado "seed-productos.json" en la raíz,
+    // útil solo para desarrollo si Supabase no responde.
+    try {
+      const fileData = fs.readFileSync(path.join(projectRoot, 'seed-productos.json'), 'utf8');
+      productos = JSON.parse(fileData);
+      console.log(`[${storeConfig.nombre}] Fallback: cargados ${productos.length} productos locales`);
+    } catch {
+      productos = [];
+    }
+  }
+}
+// Guardamos la PROMESA (no solo llamamos la función) para poder esperarla
+// desde cualquier ruta. Esto evita que, en un arranque "en frío" (Vercel
+// apaga el servidor si nadie lo usa y lo prende de nuevo en la próxima
+// visita), un pedido llegue y se responda con la lista todavía vacía
+// mientras la carga real sigue en curso de fondo.
+let productosListos = cargarProductos();
+
+// ─── Categorías (el admin las crea desde el panel) ────────────────────────
+let categorias = [];
+
+async function cargarCategorias() {
+  try {
+    const { data, error } = await supabase.from('categorias').select('*').order('nombre');
+    if (error) throw error;
+
+    if (data.length === 0 && storeConfig.categoriasIniciales.length) {
+      // Primera vez que arranca esta tienda: siembra la tabla con las
+      // categorías del .env, para no obligar a crearlas todas a mano.
+      if (supabaseService) {
+        const { data: sembradas, error: errorSiembra } = await supabaseService
+          .from('categorias')
+          .insert(storeConfig.categoriasIniciales)
+          .select();
+        if (errorSiembra) throw errorSiembra;
+        categorias = sembradas;
+        console.log(`[${storeConfig.nombre}] Categorías sembradas desde STORE_CATEGORIES (${categorias.length})`);
+      } else {
+        categorias = storeConfig.categoriasIniciales.map((c) => ({ ...c, activa: true }));
+      }
+    } else {
+      categorias = data;
+    }
+  } catch (e) {
+    console.error(`[${storeConfig.nombre}] Error al cargar categorías desde Supabase:`, e.message);
+    categorias = (storeConfig.categoriasIniciales || []).map((c) => ({ ...c, activa: true }));
+  }
+}
+let categoriasListas = cargarCategorias();
+
+function slugify(texto) {
+  return texto
+    .trim()
+    .toLowerCase()
+    .normalize('NFD').replace(/[\u0300-\u036f]/g, '') // quita acentos
+    .replace(/[^a-z0-9]+/g, '-')
+    .replace(/(^-+|-+$)/g, '');
+}
+
+// ─── Config pública (la usan index.html / search.html / admin.html) ──────
+app.get('/api/config', async (req, res) => {
+  await categoriasListas;
+  // El cliente solo ve las categorías activas — las ocultas no aparecen
+  // en los filtros ni en el buscador, para no saturar el menú con
+  // categorías que la tienda no usa.
+  res.json({ ...storeConfig.public(), categorias: categorias.filter((c) => c.activa) });
+});
+
+// Admin: TODAS las categorías (activas y ocultas), para poder gestionarlas
+// y para que el formulario de producto siga permitiendo elegir una
+// categoría oculta si hace falta reasignar algo.
+app.get('/api/admin/categories', verifyAdmin, async (req, res) => {
+  await categoriasListas;
+  res.json(categorias);
+});
+
+// ─── Catálogo ──────────────────────────────────────────────────────────────
+// Quita datos internos del admin (costo, cantidad en stock) antes de que
+// cualquier respuesta pública los toque. El cliente NUNCA debe ver esto.
+function paraCliente(p) {
+  const { costo, cantidad, ...publico } = p;
+  return publico;
+}
+
+// Público: solo lo disponible. Si no hay inventario, el admin lo oculta con
+// el interruptor "disponible" en vez de borrarlo — así el producto sigue
+// existiendo en la base de datos y no hay que recrearlo cuando vuelva a haber stock.
+app.get('/api/products', async (req, res) => {
+  await productosListos;
+  res.json(productos.filter((p) => p.disponible).map(paraCliente));
+});
+
+// Admin: todo el catálogo (disponible y no disponible, con costo/cantidad), para el dashboard y la edición.
+app.get('/api/admin/products', verifyAdmin, async (req, res) => {
+  await productosListos;
+  res.json(productos);
+});
+
+app.get('/api/products/:id', async (req, res) => {
+  await productosListos;
+  const producto = productos.find((p) => p.id === parseInt(req.params.id, 10));
+  if (!producto) return res.status(404).json({ message: 'Producto no encontrado' });
+  res.json(paraCliente(producto));
+});
+
+app.get('/api/categories', async (req, res) => {
+  await productosListos;
+  res.json([...new Set(productos.map((p) => p.categoria))]);
+});
+
+app.get('/api/subcategories/:category', async (req, res) => {
+  await productosListos;
+  const subcategorias = [...new Set(
+    productos.filter((p) => p.categoria === req.params.category).map((p) => p.subcategoria)
+  )];
+  res.json(subcategorias);
+});
+
+// ─── Tasa de cambio (solo si la tienda la usa) ────────────────────────────
+app.get('/api/rate', async (req, res) => {
+  if (!storeConfig.mostrarTasaCambio) return res.json({ rate: null });
+  try {
+    res.json({ rate: await getLatestRate() });
+  } catch (e) {
+    res.status(500).json({ error: 'No se pudo obtener la tasa de cambio' });
+  }
+});
+
+// ─── Autenticación admin ───────────────────────────────────────────────────
+app.post('/api/validatePassword', (req, res) => {
+  const { password } = req.body || {};
+  if (password !== storeConfig.admin.password) {
+    return res.status(401).json({ error: 'Contraseña incorrecta' });
+  }
+  res.json({ success: true, token: storeConfig.admin.token });
+});
+
+app.post('/api/logout', (req, res) => res.json({ success: true }));
+
+function verifyAdmin(req, res, next) {
+  const token = req.headers['x-admin-token'];
+  if (!token || token !== storeConfig.admin.token) {
+    return res.status(401).json({ error: 'No autorizado' });
+  }
+  next();
+}
+
+// ─── CRUD admin de productos ───────────────────────────────────────────────
+app.post('/api/admin/products', verifyAdmin, async (req, res) => {
+  if (!supabaseService) {
+    return res.status(500).json({ error: 'SUPABASE_SERVICE_ROLE no configurado en esta tienda' });
+  }
+  const { nombre, categoria, subcategoria, precio, disponible, imagen, img, descripcion, costo, cantidad } = req.body;
+  const { data, error } = await supabaseService.from('productos').insert([{
+    nombre, categoria, subcategoria: subcategoria || 'General',
+    precio, disponible: disponible !== false, img: imagen || img, descripcion,
+    costo: costo === '' || costo === undefined ? null : costo,
+    cantidad: cantidad === '' || cantidad === undefined ? null : cantidad,
+  }]).select();
+  if (error) return res.status(500).json({ error: error.message });
+  await cargarProductos();
+  res.json(data);
+});
+
+app.put('/api/admin/products/:id', verifyAdmin, async (req, res) => {
+  if (!supabaseService) {
+    return res.status(500).json({ error: 'SUPABASE_SERVICE_ROLE no configurado en esta tienda' });
+  }
+  const { id } = req.params;
+  const camposPermitidos = ['nombre', 'categoria', 'subcategoria', 'precio', 'disponible', 'descripcion', 'costo', 'cantidad'];
+  const cambios = {};
+  for (const campo of camposPermitidos) {
+    if (req.body[campo] !== undefined) {
+      const valor = req.body[campo];
+      // costo/cantidad son opcionales: "" (campo vacío en el form) debe
+      // guardarse como null, no como texto vacío (rompería la columna numérica).
+      cambios[campo] = (campo === 'costo' || campo === 'cantidad') && valor === '' ? null : valor;
+    }
+  }
+  // "imagen" o "img": cualquiera de los dos nombres actualiza la columna img
+  if (req.body.imagen !== undefined) cambios.img = req.body.imagen;
+  else if (req.body.img !== undefined) cambios.img = req.body.img;
+
+  if (Object.keys(cambios).length === 0) {
+    return res.status(400).json({ error: 'No hay campos para actualizar' });
+  }
+
+  const { data, error } = await supabaseService.from('productos')
+    .update(cambios)
+    .eq('id', id).select();
+  if (error) return res.status(500).json({ error: error.message });
+  if (!data || !data.length) return res.status(404).json({ error: 'Producto no encontrado' });
+
+  await cargarProductos();
+  res.json(data);
+});
+
+app.delete('/api/admin/products/:id', verifyAdmin, async (req, res) => {
+  if (!supabaseService) {
+    return res.status(500).json({ error: 'SUPABASE_SERVICE_ROLE no configurado en esta tienda' });
+  }
+  const { error } = await supabaseService.from('productos').delete().eq('id', req.params.id);
+  if (error) return res.status(500).json({ error: error.message });
+  productos = productos.filter((p) => p.id !== parseInt(req.params.id, 10));
+  res.json({ success: true });
+});
+
+// Subida de imagen (requiere service role key)
+app.post('/api/admin/upload', verifyAdmin, async (req, res) => {
+  if (!supabaseService) {
+    return res.status(500).json({ error: 'SUPABASE_SERVICE_ROLE no configurado en esta tienda' });
+  }
+  try {
+    const { imageBase64, filename, mimeType } = req.body;
+    if (!imageBase64 || !filename) return res.status(400).json({ error: 'No image provided' });
+
+    const base64Data = imageBase64.replace(/^data:image\/\w+;base64,/, '');
+    const buffer = Buffer.from(base64Data, 'base64');
+    const safeName = filename.replace(/[^a-zA-Z0-9._-]/g, '_');
+    const finalName = `productos/${Date.now()}_${safeName}`;
+
+    const { error } = await supabaseService.storage
+      .from(storeConfig.supabase.bucket)
+      .upload(finalName, buffer, { contentType: mimeType || 'image/jpeg' });
+    if (error) return res.status(500).json({ error: error.message });
+
+    const { data: urlData } = supabase.storage.from(storeConfig.supabase.bucket).getPublicUrl(finalName);
+    res.json({ url: urlData.publicUrl });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Tasa: fijarla manualmente desde el panel admin
+app.post('/api/admin/rate', verifyAdmin, async (req, res) => {
+  const { rate } = req.body;
+  if (rate == null) return res.status(400).json({ error: 'Rate is required' });
+  try {
+    await setRate(rate);
+    await cargarProductos(); // recalcula precio_cup de todo el catálogo
+    res.json({ success: true, rate });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// Categorías: el admin crea las que necesite (Alimentos, Bebidas, etc.)
+app.post('/api/admin/categories', verifyAdmin, async (req, res) => {
+  if (!supabaseService) {
+    return res.status(500).json({ error: 'SUPABASE_SERVICE_ROLE no configurado en esta tienda' });
+  }
+  await categoriasListas;
+  const { nombre } = req.body;
+  if (!nombre || !nombre.trim()) {
+    return res.status(400).json({ error: 'El nombre de la categoría es obligatorio' });
+  }
+
+  const id = slugify(nombre);
+  if (!id) return res.status(400).json({ error: 'Ese nombre no es válido' });
+  if (categorias.some((c) => c.id === id)) {
+    return res.status(409).json({ error: 'Ya existe una categoría con ese nombre' });
+  }
+
+  const { data, error } = await supabaseService
+    .from('categorias')
+    .insert([{ id, nombre: nombre.trim() }])
+    .select();
+  if (error) return res.status(500).json({ error: error.message });
+
+  categorias.push(data[0]);
+  categorias.sort((a, b) => a.nombre.localeCompare(b.nombre, 'es'));
+  res.json(data[0]);
+});
+
+// Ocultar/mostrar una categoría — no se borra, igual que con los productos.
+app.put('/api/admin/categories/:id', verifyAdmin, async (req, res) => {
+  if (!supabaseService) {
+    return res.status(500).json({ error: 'SUPABASE_SERVICE_ROLE no configurado en esta tienda' });
+  }
+  await categoriasListas;
+  const { id } = req.params;
+  const { activa, nombre } = req.body;
+
+  const cambios = {};
+  if (typeof activa === 'boolean') cambios.activa = activa;
+  if (typeof nombre === 'string' && nombre.trim()) cambios.nombre = nombre.trim();
+  if (Object.keys(cambios).length === 0) {
+    return res.status(400).json({ error: 'Nada para actualizar (envía "activa" y/o "nombre")' });
+  }
+
+  const { data, error } = await supabaseService
+    .from('categorias')
+    .update(cambios)
+    .eq('id', id)
+    .select();
+  if (error) return res.status(500).json({ error: error.message });
+  if (!data || !data.length) return res.status(404).json({ error: 'Categoría no encontrada' });
+
+  const idx = categorias.findIndex((c) => c.id === id);
+  if (idx !== -1) categorias[idx] = data[0];
+  res.json(data[0]);
+});
+
+// ─── Archivos estáticos ────────────────────────────────────────────────────
+const publicDir = path.join(projectRoot, 'public');
+
+// Reemplaza los placeholders {{STORE_...}} del HTML con los datos reales de
+// esta tienda, para que el título/descripción/imagen sean correctos incluso
+// para buscadores y vistas previas de WhatsApp/Facebook (que no ejecutan
+// JavaScript, así que lo que hace store-app.js en el navegador no les sirve).
+function renderPaginaConMeta(nombreArchivo, req) {
+  // Los archivos reales están renombrados con "_" adelante (_index.html,
+  // _search.html, _admin.html) — a propósito, para que Vercel NO encuentre
+  // un archivo físico en esa ruta y así sí le toque pasar por esta función
+  // en vez de servirlo directo como estático (ver notas en vercel.json).
+  const archivoFisico = { 'index.html': '_index.html', 'search.html': '_search.html', 'admin.html': '_admin.html' }[nombreArchivo] || nombreArchivo;
+  const ruta = path.join(publicDir, archivoFisico);
+  const html = fs.readFileSync(ruta, 'utf8');
+
+  const urlActual = `${req.protocol}://${req.get('host')}${req.originalUrl}`;
+  const titulo = storeConfig.nombre;
+  const descripcion = (storeConfig.slogan || '').trim()
+    || `Catálogo de ${storeConfig.nombre}. Haz tu pedido fácil y rápido por WhatsApp.`;
+  const logoAbsoluto = /^https?:\/\//.test(storeConfig.logo)
+    ? storeConfig.logo
+    : `${req.protocol}://${req.get('host')}${storeConfig.logo}`;
+
+  // search.html cumple dos roles distintos: ficha de un producto puntual
+  // (?id=, sí vale la pena que Google la indexe) o resultados de una
+  // búsqueda de texto libre (no debe competir con la página principal).
+  const esFichaDeProducto = nombreArchivo === 'search.html' && Boolean(req.query.id);
+  const robots = nombreArchivo === 'search.html'
+    ? (esFichaDeProducto ? 'index, follow' : 'noindex, follow')
+    : 'index, follow';
+
+  // Colores, degradado y tipografía inyectados directo en el HTML (no
+  // esperan a que JS los aplique) — evita el "flash" de color base y logo
+  // vacío que se ve un instante antes de que cargue el JavaScript.
+  const colorPrimario = storeConfig.colores.primario;
+  const colorAcento = storeConfig.colores.acento;
+  const headerGradiente = storeConfig.colores.headerGradiente || colorPrimario;
+  const fuenteTitulo = storeConfig.fuenteTitulo || 'inherit';
+  const fuenteCuerpo = storeConfig.fuenteCuerpo || 'system-ui, sans-serif';
+  const fontLinkTag = storeConfig.fuenteGoogleUrl
+    ? `<link rel="stylesheet" href="${storeConfig.fuenteGoogleUrl}" />`
+    : '';
+
+  return html
+    .split('{{STORE_TITLE}}').join(titulo)
+    .split('{{STORE_DESCRIPTION}}').join(descripcion)
+    .split('{{STORE_OG_IMAGE}}').join(logoAbsoluto)
+    .split('{{STORE_URL}}').join(urlActual)
+    .split('{{STORE_LOGO}}').join(storeConfig.logo)
+    .split('{{STORE_ROBOTS}}').join(robots)
+    .split('{{STORE_COLOR_PRIMARIO}}').join(colorPrimario)
+    .split('{{STORE_COLOR_ACENTO}}').join(colorAcento)
+    .split('{{STORE_HEADER_GRADIENTE}}').join(headerGradiente)
+    .split('{{STORE_FUENTE_TITULO}}').join(fuenteTitulo)
+    .split('{{STORE_FUENTE_CUERPO}}').join(fuenteCuerpo)
+    .split('{{STORE_FONT_LINK}}').join(fontLinkTag);
+}
+
+app.get('/', (req, res) => res.send(renderPaginaConMeta('index.html', req)));
+app.get('/search.html', (req, res) => res.send(renderPaginaConMeta('search.html', req)));
+app.get('/admin.html', (req, res) => res.send(renderPaginaConMeta('admin.html', req)));
+
+// Evita el 404 de favicon.ico que piden algunos navegadores por su cuenta,
+// aunque ya exista el <link rel="icon"> apuntando al logo.
+app.get('/favicon.ico', (req, res) => res.redirect(storeConfig.logo));
+
+app.use(express.static(publicDir));
+
+export default app;

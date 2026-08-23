@@ -1,0 +1,518 @@
+// public/js/store-app.js
+// Lógica compartida por index.html, search.html y product.html.
+// No contiene NADA específico de una tienda: todo llega desde /api/config.
+
+window.STORE = {
+  config: null,
+  rate: null,
+  cart: JSON.parse(localStorage.getItem('cart') || '[]'),
+};
+
+async function initStore() {
+  const [configRes, rateRes] = await Promise.all([
+    fetch('/api/config').then((r) => r.json()),
+    fetch('/api/rate').then((r) => r.json()).catch(() => ({ rate: null })),
+  ]);
+  window.STORE.config = configRes;
+  window.STORE.rate = rateRes.rate;
+  applyBranding(configRes);
+  updateCartBadge();
+  return configRes;
+}
+
+function applyBranding(config) {
+  // En admin.html el título del servidor trae "· Admin" al final —
+  // lo mantenemos aquí en vez de perderlo cuando JS actualiza el título.
+  const esPanelAdmin = Boolean(document.getElementById('adminNav'));
+  document.title = esPanelAdmin ? `${config.nombre} · Admin` : config.nombre;
+
+  // Colores vía variables CSS -> permite que styles.css sea igual en todas las tiendas
+  document.documentElement.style.setProperty('--color-primario', config.colores.primario);
+  document.documentElement.style.setProperty('--color-acento', config.colores.acento);
+  document.documentElement.style.setProperty(
+    '--header-gradiente',
+    config.colores.headerGradiente || config.colores.primario
+  );
+
+  // Tipografías del tema (opcional). Si la tienda eligió un tema con
+  // fuentes de Google Fonts, se inyecta el link una sola vez.
+  if (config.fuenteGoogleUrl && !document.getElementById('storeFontLink')) {
+    const link = document.createElement('link');
+    link.id = 'storeFontLink';
+    link.rel = 'stylesheet';
+    link.href = config.fuenteGoogleUrl;
+    document.head.appendChild(link);
+  }
+  document.documentElement.style.setProperty('--fuente-titulo', config.fuenteTitulo || 'inherit');
+  document.documentElement.style.setProperty('--fuente-cuerpo', config.fuenteCuerpo || 'system-ui, sans-serif');
+
+  document.querySelectorAll('[data-store="nombre"]').forEach((el) => (el.textContent = config.nombre));
+  document.querySelectorAll('[data-store="slogan"]').forEach((el) => (el.textContent = config.slogan));
+  document.querySelectorAll('[data-store="logo"]').forEach((el) => (el.src = config.logo));
+  document.querySelectorAll('[data-store="email"]').forEach((el) => {
+    el.textContent = config.email;
+    el.href = `mailto:${config.email}`;
+  });
+  document.querySelectorAll('[data-store="whatsapp-link"]').forEach((el) => {
+    el.href = `https://wa.me/${config.whatsapp}`;
+  });
+  document.querySelectorAll('[data-store="facebook"]').forEach((el) => {
+    if (config.facebook) el.href = config.facebook;
+    else el.style.display = 'none';
+  });
+  document.querySelectorAll('[data-store="direccion"]').forEach((el) => (el.textContent = config.direccion || ''));
+  document.querySelectorAll('[data-store="horario"]').forEach((el) => (el.textContent = config.horario || ''));
+  document.querySelectorAll('[data-store="anio"]').forEach((el) => (el.textContent = new Date().getFullYear()));
+
+  const tasaEl = document.getElementById('exchangeRateDisplay');
+  if (tasaEl) {
+    if (config.mostrarTasaCambio) {
+      tasaEl.style.display = '';
+      tasaEl.textContent = `Tasa: ${window.STORE.rate ?? '--'}`;
+    } else {
+      tasaEl.style.display = 'none';
+    }
+  }
+
+  renderCategoryButtons(config.categorias);
+}
+
+function renderCategoryButtons(categorias) {
+  const contenedor = document.getElementById('categoryButtons');
+  if (!contenedor) return;
+  contenedor.innerHTML = categorias
+    .map((c) => `<button class="cat-btn" data-cat="${c.id}" aria-pressed="false">${escapeHtml(c.nombre)}</button>`)
+    .join('');
+}
+
+// ─── Carrito ────────────────────────────────────────────────────────────
+function addToCart(producto) {
+  const cart = window.STORE.cart;
+  const existente = cart.find((i) => i.id === producto.id);
+  if (existente) existente.cantidad += 1;
+  else cart.push({ ...producto, cantidad: 1 });
+  localStorage.setItem('cart', JSON.stringify(cart));
+  updateCartBadge();
+  mostrarToast(`${producto.nombre} agregado ✅`);
+}
+
+// ─── Toast de confirmación (aparece y desaparece solo) ────────────────────
+let toastTimeoutId = null;
+function mostrarToast(mensaje) {
+  let toast = document.getElementById('storeToast');
+  if (!toast) {
+    toast = document.createElement('div');
+    toast.id = 'storeToast';
+    toast.className = 'store-toast';
+    toast.setAttribute('role', 'status');
+    toast.setAttribute('aria-live', 'polite');
+    document.body.appendChild(toast);
+  }
+  toast.textContent = mensaje;
+  toast.classList.add('visible');
+  clearTimeout(toastTimeoutId);
+  toastTimeoutId = setTimeout(() => toast.classList.remove('visible'), 2200);
+}
+
+function updateCartBadge() {
+  const badge = document.getElementById('cartCount');
+  if (!badge) return;
+  const total = window.STORE.cart.reduce((acc, i) => acc + i.cantidad, 0);
+  badge.textContent = total;
+}
+
+// ─── Modal del carrito: el cliente revisa antes de mandar el pedido ───────
+// Se inyecta una sola vez en cualquier página que llame a initStore(),
+// así no hace falta repetir este HTML en index.html/search.html.
+function ensureCartModal() {
+  if (document.getElementById('storeCartOverlay')) return;
+  const overlay = document.createElement('div');
+  overlay.id = 'storeCartOverlay';
+  overlay.className = 'cart-overlay';
+  overlay.innerHTML = `
+    <div class="cart-modal" role="dialog" aria-modal="true" aria-labelledby="cartModalTitulo">
+      <div class="cart-modal-header">
+        <h3 id="cartModalTitulo">Tu carrito</h3>
+        <button class="cart-close" onclick="StoreApp.closeCart()" aria-label="Cerrar carrito">✕</button>
+      </div>
+      <div id="cartItemsList" class="cart-items-list"></div>
+      <div class="cart-modal-footer">
+        <div class="cart-total-row"><span>Total</span><span id="cartTotalDisplay">$0.00</span></div>
+        <button class="cart-continue" onclick="StoreApp.closeCart()">Seguir comprando</button>
+        <button class="cart-whatsapp-btn" id="cartWhatsappBtn" onclick="StoreApp.checkoutPorWhatsApp()">Enviar pedido por WhatsApp</button>
+      </div>
+    </div>
+  `;
+  document.body.appendChild(overlay);
+  overlay.addEventListener('click', (e) => { if (e.target === overlay) closeCart(); });
+  document.addEventListener('keydown', (e) => {
+    if (!overlay.classList.contains('open')) return;
+    if (e.key === 'Escape') { closeCart(); return; }
+    if (e.key === 'Tab') atraparFoco(e, overlay);
+  });
+}
+
+// Mantiene el Tab/Shift+Tab dentro del modal mientras está abierto —
+// sin esto, la tecla Tab se "escapa" hacia el resto de la página.
+function atraparFoco(e, overlay) {
+  const focosables = overlay.querySelectorAll('button, a[href], input, select, textarea, [tabindex]:not([tabindex="-1"])');
+  if (!focosables.length) return;
+  const primero = focosables[0];
+  const ultimo = focosables[focosables.length - 1];
+
+  if (e.shiftKey && document.activeElement === primero) {
+    e.preventDefault();
+    ultimo.focus();
+  } else if (!e.shiftKey && document.activeElement === ultimo) {
+    e.preventDefault();
+    primero.focus();
+  }
+}
+
+function renderCartItems() {
+  const cart = window.STORE.cart;
+  const list = document.getElementById('cartItemsList');
+  const totalDisplay = document.getElementById('cartTotalDisplay');
+  const whatsappBtn = document.getElementById('cartWhatsappBtn');
+
+  if (!cart.length) {
+    list.innerHTML = '<p class="cart-empty-msg">Tu carrito está vacío.</p>';
+    totalDisplay.textContent = `$${formatMoney(0)}`;
+    if (whatsappBtn) whatsappBtn.disabled = true;
+    return;
+  }
+
+  if (whatsappBtn) whatsappBtn.disabled = false;
+  list.innerHTML = cart.map((item) => {
+    const nombreSeguro = escapeHtml(item.nombre);
+    return `
+    <div class="cart-item-row">
+      <img src="${item.img}" alt="${nombreSeguro}" />
+      <div class="info">
+        <div class="nombre">${nombreSeguro}</div>
+        <div class="precio">${formatPrecio(item.precio_usd, item.precio_cup)} c/u</div>
+      </div>
+      <div class="cart-qty">
+        <button onclick="StoreApp.changeCartQty(${item.id}, -1)" aria-label="Quitar uno">−</button>
+        <span>${item.cantidad}</span>
+        <button onclick="StoreApp.changeCartQty(${item.id}, 1)" aria-label="Agregar uno">+</button>
+      </div>
+      <button class="cart-item-remove" onclick="StoreApp.removeCartItem(${item.id})" title="Quitar del carrito">🗑</button>
+    </div>
+  `;
+  }).join('');
+
+  const total = cart.reduce((acc, i) => acc + (i.precio_usd || 0) * i.cantidad, 0);
+  const totalCup = cart.reduce((acc, i) => acc + (i.precio_cup || 0) * i.cantidad, 0);
+  totalDisplay.textContent = formatTotal(total, totalCup);
+}
+
+let elementoAntesDeModal = null;
+
+function openCart() {
+  elementoAntesDeModal = document.activeElement;
+  ensureCartModal();
+  renderCartItems();
+  const overlay = document.getElementById('storeCartOverlay');
+  overlay.classList.add('open');
+  overlay.querySelector('.cart-close')?.focus();
+}
+
+function closeCart() {
+  const overlay = document.getElementById('storeCartOverlay');
+  if (overlay) overlay.classList.remove('open');
+  elementoAntesDeModal?.focus();
+}
+
+function changeCartQty(id, delta) {
+  const cart = window.STORE.cart;
+  const item = cart.find((i) => i.id === id);
+  if (!item) return;
+  item.cantidad += delta;
+  if (item.cantidad <= 0) {
+    window.STORE.cart = cart.filter((i) => i.id !== id);
+  }
+  localStorage.setItem('cart', JSON.stringify(window.STORE.cart));
+  updateCartBadge();
+  renderCartItems();
+}
+
+function removeCartItem(id) {
+  window.STORE.cart = window.STORE.cart.filter((i) => i.id !== id);
+  localStorage.setItem('cart', JSON.stringify(window.STORE.cart));
+  updateCartBadge();
+  renderCartItems();
+}
+
+function checkoutPorWhatsApp() {
+  const { config, cart } = window.STORE;
+  if (!cart.length) return;
+  const detalle = cart
+    .map((i) => `• ${i.nombre} x${i.cantidad} — ${formatPrecio(i.precio_usd, i.precio_cup)}`)
+    .join('%0A');
+  const total = cart.reduce((acc, i) => acc + (i.precio_usd || 0) * i.cantidad, 0);
+  const totalCup = cart.reduce((acc, i) => acc + (i.precio_cup || 0) * i.cantidad, 0);
+  const mensaje = `Hola, quiero pedir:%0A${detalle}%0A%0ATotal: ${formatTotal(total, totalCup)}`;
+  window.open(`https://wa.me/${config.whatsapp}?text=${mensaje}`, '_blank');
+}
+
+// ─── Buscador (usado en index.html y search.html) ─────────────────────────
+function buildSearchUrl(query, category) {
+  const params = new URLSearchParams();
+  if (query) params.set('q', query);
+  if (category) params.set('cat', category);
+  return `search.html?${params.toString()}`;
+}
+
+function submitSearch() {
+  const query = document.getElementById('searchText')?.value.trim() || '';
+  const category = document.getElementById('searchCategory')?.value || '';
+  window.location.href = buildSearchUrl(query, category);
+}
+
+// Formato contable: 1.00 | 1,234.56 — mismo formato usado en las tiendas anteriores.
+// Escapa texto que viene de la base de datos (nombre, descripción,
+// categoría — cualquier cosa que haya escrito un administrador) antes de
+// insertarlo dentro de innerHTML. Sin esto, un nombre de producto con
+// algo como <img src=x onerror=...> se ejecutaría en el navegador del
+// cliente que ve la tienda.
+function escapeHtml(valor) {
+  if (valor === null || valor === undefined) return '';
+  return String(valor)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+}
+
+// Para cuando un objeto se pasa como JSON dentro de un atributo
+// onclick='...' (comillas simples): si algún campo trae una comilla
+// simple (ej. un nombre de producto con apóstrofe), rompería el atributo
+// HTML antes de que el navegador llegue a interpretarlo como JS.
+function jsonParaAtributo(obj) {
+  return JSON.stringify(obj).replace(/'/g, '&#39;');
+}
+
+function formatMoney(value) {
+  if (value === null || value === undefined || isNaN(value)) return '';
+  return Number(value).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+}
+
+// Formatea el precio de UN producto, sea cual sea el modo de la tienda:
+// - Solo USD:      "$5.00"
+// - USD + CUP:      "$5.00 / 1600.00 CUP"
+// - Solo CUP:      "1600.00 CUP"   (sin signo $, porque no hay USD)
+function formatPrecio(precioUsd, precioCup) {
+  const partes = [];
+  if (precioUsd !== null && precioUsd !== undefined) partes.push(`$${formatMoney(precioUsd)}`);
+  if (precioCup !== null && precioCup !== undefined) partes.push(`${formatMoney(precioCup)} CUP`);
+  return partes.join(' / ');
+}
+
+// Formatea un TOTAL (suma de varios productos). Se basa en el modo de la
+// tienda (config.soloCup) en vez de mirar item por item, porque dentro de
+// una misma tienda todos los productos comparten el mismo modo de moneda.
+function formatTotal(totalUsd, totalCup) {
+  const config = window.STORE.config;
+  if (config?.soloCup) return `${formatMoney(totalCup)} CUP`;
+  return `$${formatMoney(totalUsd)}${totalCup ? ` / ${formatMoney(totalCup)} CUP` : ''}`;
+}
+
+// ─── Tarjeta de producto (usada por index.html y search.html) ────────────
+function renderProductCard(p) {
+  const nombreSeguro = escapeHtml(p.nombre);
+  return `
+    <div class="product-card">
+      <div class="img-wrap">
+        <img src="${p.img}" alt="${nombreSeguro}" loading="lazy" />
+      </div>
+      <div class="body">
+        <div>${nombreSeguro}</div>
+        <div class="price">${formatPrecio(p.precio_usd, p.precio_cup)}</div>
+        <button onclick='StoreApp.addToCart(${jsonParaAtributo(p)})' aria-label="Agregar ${nombreSeguro} al carrito">Agregar</button>
+      </div>
+    </div>
+  `;
+}
+
+// Skeleton screens: se muestran mientras se espera la respuesta real del
+// catálogo, en vez de un texto plano "Cargando..." — se percibe más rápido.
+// Schema.org (JSON-LD) para la ficha de detalle de un producto — ayuda a
+// que los buscadores muestren precio/disponibilidad directo en resultados.
+// Se llama solo en la página de detalle (no en la grilla de catálogo).
+function inyectarSchemaProducto(producto) {
+  const anterior = document.getElementById('productSchema');
+  if (anterior) anterior.remove();
+
+  const precio = producto.precio_usd ?? producto.precio_cup;
+  if (precio == null) return; // sin precio no armamos el schema
+
+  const moneda = producto.precio_usd != null ? 'USD' : 'CUP';
+  const schema = {
+    '@context': 'https://schema.org',
+    '@type': 'Product',
+    name: producto.nombre,
+    image: producto.img,
+    description: producto.descripcion || producto.nombre,
+    offers: {
+      '@type': 'Offer',
+      price: precio,
+      priceCurrency: moneda,
+      availability: producto.disponible !== false
+        ? 'https://schema.org/InStock'
+        : 'https://schema.org/OutOfStock',
+      url: window.location.href,
+    },
+  };
+
+  const script = document.createElement('script');
+  script.type = 'application/ld+json';
+  script.id = 'productSchema';
+  script.textContent = JSON.stringify(schema);
+  document.head.appendChild(script);
+}
+
+function renderSkeletons(cantidad = 6) {
+  const una = `
+    <div class="skeleton-card">
+      <div class="skeleton-img"></div>
+      <div class="skeleton-body">
+        <div class="skeleton-line corta"></div>
+        <div class="skeleton-line"></div>
+        <div class="skeleton-line precio"></div>
+        <div class="skeleton-line boton"></div>
+      </div>
+    </div>
+  `;
+  return una.repeat(cantidad);
+}
+
+// Efecto "spotlight": el brillo sigue al mouse sobre la imagen del producto.
+// Se engancha una sola vez al contenedor (delegación), sirve para grillas
+// que se re-renderizan constantemente (filtros, búsqueda, etc.).
+function attachSpotlight(containerSelector) {
+  const contenedor = document.querySelector(containerSelector);
+  if (!contenedor || contenedor.dataset.spotlightBound) return;
+  contenedor.dataset.spotlightBound = '1';
+  contenedor.addEventListener('mousemove', (e) => {
+    const wrap = e.target.closest('.img-wrap');
+    if (!wrap) return;
+    const rect = wrap.getBoundingClientRect();
+    wrap.style.setProperty('--x', `${e.clientX - rect.left}px`);
+    wrap.style.setProperty('--y', `${e.clientY - rect.top}px`);
+  });
+}
+
+// ─── Autocompletado de búsqueda (dropdown tipo "ag" -> "Agua", "Agarradera") ─
+// inputEl: <input> de texto. dropdownEl: contenedor donde se pintan las sugerencias.
+// getProductos: función que devuelve el array de productos ya cargado.
+// onSelect(producto): qué hacer al elegir una sugerencia (por defecto, ir a search.html?id=).
+function setupAutocomplete(inputEl, dropdownEl, getProductos, onSelect) {
+  if (!inputEl || !dropdownEl) return;
+  let indiceActivo = -1;
+
+  inputEl.setAttribute('role', 'combobox');
+  inputEl.setAttribute('aria-autocomplete', 'list');
+  inputEl.setAttribute('aria-expanded', 'false');
+  dropdownEl.setAttribute('role', 'listbox');
+
+  function cerrar() {
+    dropdownEl.classList.remove('open');
+    dropdownEl.innerHTML = '';
+    indiceActivo = -1;
+    inputEl.setAttribute('aria-expanded', 'false');
+    inputEl.removeAttribute('aria-activedescendant');
+  }
+
+  function seleccionar(producto) {
+    cerrar();
+    inputEl.value = producto.nombre;
+    if (onSelect) onSelect(producto);
+    else window.location.href = `search.html?id=${producto.id}`;
+  }
+
+  function render(query) {
+    const productos = getProductos() || [];
+    const q = query.trim().toLowerCase();
+    if (!q) { cerrar(); return; }
+
+    const coincidencias = productos
+      .filter((p) => p.nombre.toLowerCase().includes(q))
+      .slice(0, 8);
+
+    if (!coincidencias.length) { cerrar(); return; }
+
+    dropdownEl.innerHTML = coincidencias.map((p, i) => `
+      <div class="suggestion-item" id="sugerencia-${i}" role="option" aria-selected="false" data-idx="${i}" data-id="${p.id}">
+        <span>${escapeHtml(p.nombre)}</span>
+        <span class="cat">${escapeHtml(p.categoria)}</span>
+      </div>
+    `).join('');
+    dropdownEl.classList.add('open');
+    inputEl.setAttribute('aria-expanded', 'true');
+    indiceActivo = -1;
+
+    dropdownEl.querySelectorAll('.suggestion-item').forEach((el) => {
+      el.addEventListener('mousedown', (e) => {
+        e.preventDefault(); // evita que el input pierda foco antes del click
+        const producto = productos.find((p) => p.id === parseInt(el.dataset.id, 10));
+        if (producto) seleccionar(producto);
+      });
+    });
+  }
+
+  inputEl.addEventListener('input', () => render(inputEl.value));
+  inputEl.addEventListener('focus', () => { if (inputEl.value.trim()) render(inputEl.value); });
+
+  inputEl.addEventListener('keydown', (e) => {
+    const items = [...dropdownEl.querySelectorAll('.suggestion-item')];
+    if (!items.length) return;
+    if (e.key === 'ArrowDown') {
+      e.preventDefault();
+      indiceActivo = Math.min(indiceActivo + 1, items.length - 1);
+    } else if (e.key === 'ArrowUp') {
+      e.preventDefault();
+      indiceActivo = Math.max(indiceActivo - 1, 0);
+    } else if (e.key === 'Enter' && indiceActivo >= 0) {
+      e.preventDefault();
+      items[indiceActivo].dispatchEvent(new Event('mousedown'));
+      return;
+    } else {
+      return;
+    }
+    items.forEach((el, i) => {
+      const activo = i === indiceActivo;
+      el.classList.toggle('highlighted', activo);
+      el.setAttribute('aria-selected', String(activo));
+    });
+    inputEl.setAttribute('aria-activedescendant', items[indiceActivo].id);
+  });
+
+  document.addEventListener('click', (e) => {
+    if (e.target !== inputEl && !dropdownEl.contains(e.target)) cerrar();
+  });
+}
+
+window.StoreApp = {
+  initStore,
+  addToCart,
+  checkoutPorWhatsApp,
+  submitSearch,
+  buildSearchUrl,
+  formatMoney,
+  formatPrecio,
+  formatTotal,
+  renderProductCard,
+  attachSpotlight,
+  setupAutocomplete,
+  openCart,
+  closeCart,
+  changeCartQty,
+  removeCartItem,
+  mostrarToast,
+  renderSkeletons,
+  inyectarSchemaProducto,
+  escapeHtml,
+  jsonParaAtributo,
+};
