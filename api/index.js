@@ -285,7 +285,8 @@ app.post('/api/admin/upload', verifyAdmin, async (req, res) => {
 
     const { error } = await supabaseService.storage
       .from(storeConfig.supabase.bucket)
-      .upload(finalName, buffer, { contentType: mimeType || 'image/jpeg' });
+      .upload(finalName, buffer, { contentType: mimeType || 'image/jpeg',
+        cacheControl: '31536000', });
     if (error) return res.status(500).json({ error: error.message });
 
     const { data: urlData } = supabase.storage.from(storeConfig.supabase.bucket).getPublicUrl(finalName);
