@@ -226,6 +226,16 @@ app.post('/api/admin/products', verifyAdmin, async (req, res) => {
   res.json(data);
 });
 
+// Extrae la ruta dentro del bucket a partir de la URL pública completa,
+// para poder borrar el archivo viejo del Storage cuando se reemplaza.
+function extraerRutaStorage(urlCompleta, bucket) {
+  if (!urlCompleta) return null;
+  const marcador = `/public/${bucket}/`;
+  const idx = urlCompleta.indexOf(marcador);
+  if (idx === -1) return null;
+  return urlCompleta.slice(idx + marcador.length);
+}
+
 app.put('/api/admin/products/:id', verifyAdmin, async (req, res) => {
   if (!supabaseService) {
     return res.status(500).json({ error: 'SUPABASE_SERVICE_ROLE no configurado en esta tienda' });
@@ -236,17 +246,22 @@ app.put('/api/admin/products/:id', verifyAdmin, async (req, res) => {
   for (const campo of camposPermitidos) {
     if (req.body[campo] !== undefined) {
       const valor = req.body[campo];
-      // costo/cantidad son opcionales: "" (campo vacío en el form) debe
-      // guardarse como null, no como texto vacío (rompería la columna numérica).
       cambios[campo] = (campo === 'costo' || campo === 'cantidad') && valor === '' ? null : valor;
     }
   }
-  // "imagen" o "img": cualquiera de los dos nombres actualiza la columna img
   if (req.body.imagen !== undefined) cambios.img = req.body.imagen;
   else if (req.body.img !== undefined) cambios.img = req.body.img;
 
   if (Object.keys(cambios).length === 0) {
     return res.status(400).json({ error: 'No hay campos para actualizar' });
+  }
+
+  // NUEVO: si se va a reemplazar la imagen, guardamos cuál era la vieja
+  // ANTES de sobrescribirla, para poder borrarla del Storage después.
+  let imagenVieja = null;
+  if (cambios.img !== undefined) {
+    const { data: actual } = await supabaseService.from('productos').select('img').eq('id', id).single();
+    imagenVieja = actual?.img || null;
   }
 
   const { data, error } = await supabaseService.from('productos')
@@ -255,18 +270,19 @@ app.put('/api/admin/products/:id', verifyAdmin, async (req, res) => {
   if (error) return res.status(500).json({ error: error.message });
   if (!data || !data.length) return res.status(404).json({ error: 'Producto no encontrado' });
 
+  // NUEVO: borrar la imagen vieja del Storage, solo si de verdad cambió.
+  // Es "best-effort": si falla el borrado, no tumbamos la respuesta —
+  // el producto ya se guardó bien, esto es solo limpieza.
+  if (imagenVieja && imagenVieja !== cambios.img) {
+    const ruta = extraerRutaStorage(imagenVieja, storeConfig.supabase.bucket);
+    if (ruta) {
+      supabaseService.storage.from(storeConfig.supabase.bucket).remove([ruta])
+        .catch((e) => console.error('No se pudo borrar la imagen vieja:', e.message));
+    }
+  }
+
   await cargarProductos();
   res.json(data);
-});
-
-app.delete('/api/admin/products/:id', verifyAdmin, async (req, res) => {
-  if (!supabaseService) {
-    return res.status(500).json({ error: 'SUPABASE_SERVICE_ROLE no configurado en esta tienda' });
-  }
-  const { error } = await supabaseService.from('productos').delete().eq('id', req.params.id);
-  if (error) return res.status(500).json({ error: error.message });
-  productos = productos.filter((p) => p.id !== parseInt(req.params.id, 10));
-  res.json({ success: true });
 });
 
 // Subida de imagen (requiere service role key)
