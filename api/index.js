@@ -381,7 +381,42 @@ app.put('/api/admin/categories/:id', verifyAdmin, async (req, res) => {
   if (idx !== -1) categorias[idx] = data[0];
   res.json(data[0]);
 });
+// Registrar un pedido automáticamente cuando el cliente da "Enviar por WhatsApp".
+// Pública (la llama el propio checkout del cliente) — pero solo inserta, nunca lee ni modifica.
+app.post('/api/pedidos', async (req, res) => {
+  if (!supabaseService) return res.status(500).json({ error: 'SUPABASE_SERVICE_ROLE no configurado' });
+  const { items, totalUsd, totalCup } = req.body;
+  if (!Array.isArray(items) || !items.length) {
+    return res.status(400).json({ error: 'El pedido no tiene productos' });
+  }
+  const { error } = await supabaseService.from('pedidos').insert([{
+    items, total_usd: totalUsd ?? null, total_cup: totalCup ?? null, estado: 'pendiente',
+  }]);
+  if (error) return res.status(500).json({ error: error.message });
+  res.json({ success: true });
+});
 
+// Listar pedidos (admin)
+app.get('/api/admin/pedidos', verifyAdmin, async (req, res) => {
+  if (!supabaseService) return res.status(500).json({ error: 'SUPABASE_SERVICE_ROLE no configurado' });
+  const { data, error } = await supabaseService.from('pedidos').select('*').order('fecha', { ascending: false });
+  if (error) return res.status(500).json({ error: error.message });
+  res.json(data);
+});
+
+// Marcar un pedido como concretado / no concretado
+app.put('/api/admin/pedidos/:id', verifyAdmin, async (req, res) => {
+  if (!supabaseService) return res.status(500).json({ error: 'SUPABASE_SERVICE_ROLE no configurado' });
+  const { estado } = req.body;
+  if (!['pendiente', 'concretado', 'no_concretado'].includes(estado)) {
+    return res.status(400).json({ error: 'Estado inválido' });
+  }
+  const { error } = await supabaseService.from('pedidos')
+    .update({ estado, actualizado_en: new Date().toISOString() })
+    .eq('id', req.params.id);
+  if (error) return res.status(500).json({ error: error.message });
+  res.json({ success: true });
+});
 // ─── Archivos estáticos ────────────────────────────────────────────────────
 const publicDir = path.join(projectRoot, 'public');
 
