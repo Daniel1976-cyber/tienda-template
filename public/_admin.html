@@ -244,7 +244,7 @@
           <div class="label">Pendientes de marcar</div>
         </div>
       </div>
-      <div id="pedidosContenedor">Cargando...</div>
+      <div id="pedidosContenedor" style="margin-top: 1rem;">Cargando...</div>
     </div>
   </div>
 
@@ -593,7 +593,17 @@
       document.getElementById('pedidosContenedor').innerHTML = 'Cargando...';
       const res = await fetch('/api/admin/pedidos', { headers: { 'x-admin-token': token } });
       if (res.status === 401) { logout(); return; }
-      pedidosCache = await res.json();
+      const data = await res.json();
+
+      pedidosCache = data.map((p) => ({
+        ...p,
+        id: String(p.id),
+        fecha: p.fecha ? p.fecha.replace(' ', 'T') : null,
+        total_usd: p.total_usd != null ? Number(p.total_usd) : null,
+        total_cup: p.total_cup != null ? Number(p.total_cup) : null,
+        items: Array.isArray(p.items) ? p.items : [],
+      }));
+
       renderListaPedidos();
     }
 
@@ -616,9 +626,9 @@
         contenedor.innerHTML = '<p style="color:#64748b;">No hay pedidos para este filtro.</p>';
       } else {
         contenedor.innerHTML = lista.map((p) => {
-          const fecha = new Date(p.fecha).toLocaleString('es-ES');
-          const items = Array.isArray(p.items) ? p.items.length : 0;
-          const total = p.total_usd ? `$${p.total_usd.toFixed(2)}` : '–';
+          const fecha = p.fecha ? new Date(p.fecha).toLocaleString('es-ES') : '–';
+          const items = p.items.length;
+          const total = p.total_usd != null ? `$${p.total_usd.toFixed(2)}` : '–';
           return `
           <div class="pedido-row">
             <div class="info">
